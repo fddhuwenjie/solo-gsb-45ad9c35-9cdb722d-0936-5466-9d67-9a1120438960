@@ -1,6 +1,6 @@
 # 家庭储能时段调度 API
 
-基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；批次边界与首次回执随记录同事务落库，**起点、长度、内容都与某已确认整批一致**的重试幂等返回该批首收回执（不随后续批次漂移），短批、内容变更或跨批拼接等重叠上报一律 409、只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。满期（`complete`）会话还支持**计量表更正**：按会话经 HTTP 提交期望修订号与若干「时段下标 + 完整替换记录」，服务端在当前版本上叠加（未指定时段保持原值）并用会话容量、效率、初始 SOC 与审计容差**重新核对整段台账**，下标重复/越界、任一时段能量失衡或相邻 SOC 断点都整次拒绝、已有修订不变；核对通过后原子落盘修订号与修订台账（修订号从 0 起单调递增，过期返回 409 与当前号）。**最初上报记录、原会话查询、批次重试判定与首收回执永不被更正改写**；更正查询返回原始与当前修订记录、差异下标、历次更正，以及可直接提交现有结算接口的完整请求数据；重启后修订仍可查询并继续更正。
+基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；批次边界与首次回执随记录同事务落库，**起点、长度、内容都与某已确认整批一致**的重试幂等返回该批首收回执（不随后续批次漂移），短批、内容变更或跨批拼接等重叠上报一律 409、只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。满期（`complete`）会话还支持**计量表更正**：按会话经 HTTP 提交期望修订号与若干「时段下标 + 完整替换记录」，服务端在当前版本上叠加（未指定时段保持原值）并用会话容量、效率、初始 SOC 与审计容差**重新核对整段台账**，下标重复/越界、任一时段能量失衡或相邻 SOC 断点都整次拒绝、已有修订不变；核对通过后原子落盘修订号与修订台账（修订号从 0 起单调递增，过期返回 409 与当前号）。**最初上报记录、原会话查询、批次重试判定与首收回执永不被更正改写**；更正查询返回原始与当前修订记录、差异下标、历次更正，以及可直接提交现有结算接口的完整请求数据；重启后修订仍可查询并继续更正。满期会话还可经 `POST /dispatch/sessions/{id}/vouchers` 按修订号**出具逐版结算凭证**：修订号 0 对最初上报记录、其余版本对对应更正台账，沿用现有结算规则在同一写事务内核算落盘（**只能结算有效前缀时整次拒绝且不留下凭证**）；凭证保存修订号、结算摘要、实测总费用、出单时间并冻结该版台账与完整结算报告，**首张记全额、以后每张列出相对上一张的应补或应退差额（允许跳过未出单的中间修订）**，同一修订号重试始终返回原凭证（即使后来发生更正），未出单的过期修订号返回 409 及当前号；`GET .../vouchers` 按出单次序查询凭证并返回当前修订待出单状态，凭证持久化在命名卷 SQLite 中，重启后仍可查，出单与并发更正互斥使凭证不会引用过期台账。
 
 ## 一条命令启动
 
@@ -697,9 +697,208 @@ curl -s -X POST $BASE/dispatch/sessions/$SID/batches -H 'Content-Type:applicatio
 
 重启验证：`docker compose restart`（命名卷保留）后再次执行第 4 步，修订历史与当前台账仍在；继续更正须带查询到的 `current_revision`，带旧号提交返回 409 与当前号。
 
+### `POST /dispatch/sessions/{session_id}/vouchers` — 出具逐版结算凭证
+
+满期会话可按修订号出具**可追溯的逐版结算凭证**。请求体只有一个字段：`{"expected_revision": 修订号}`。
+
+- **修订号 0**：对**最初上报记录**结算；**修订号 n≥1**：对**修订号 n 的更正台账**（每次更正成功时整段冻结落盘）结算；
+- 核算完全**沿用现有结算规则**：原计划重算核对 → 遥测审计 → SOC 轨迹核对 → 计费，即凭证冻结的 `settlement` 与直接 POST `/dispatch/settlement` 的结果逐字段一致；
+- **只能结算有效前缀**（首条即异常的 `no_valid_interval`，或从某条起异常 / SOC 断点的 `voucher_partial_settled`）时**整次拒绝，不留下任何凭证**；计量表更正在提交时已保证整段遥测自洽，但不核对计划 SOC 轨迹，因此「自洽却偏离计划」的修订会在此被拦下，可再提交一次修复台账的更正后对新修订号出单；
+- 凭证保存**修订号、结算摘要、实测总费用、出单时间**，并冻结出单时该版**完整台账与完整结算报告**（`records` / `settlement`）；
+- **计费栏 `billing`**：本会话**首张凭证记全额**（`type=full`）；其后每张列出**相对上一张凭证**的差额——总费用升高为应补（`supplement`）、降低为应退（`refund`）、相等为 `no_adjustment`；差额总是相对**最近一张已出凭证**，因此**允许跳过未出单的中间修订**（`relative_to_revision` / `relative_to_voucher_no` 指明对比的是哪一张）；
+- **幂等**：同一修订号重试，返回落盘时冻结的**原凭证**（`result=existing`，`voucher_id` / `issued_at` / `billing` / 台账 / 结算报告全部不变），**即使后来又有更新的修订**；
+- **冲突**：请求修订号**未出单且不是当前修订号**（漏开的过期版本或超前版本）→ **HTTP 409 `voucher_revision_conflict`**，错误体附 `current_revision`，不写入；
+- 出单与计量表更正共用同一把 SQLite 写事务锁：「取当前号 → 取该版台账 → 核算 → 落盘」整段原子，并发更正不可能插到中间使凭证引用过期台账；核算失败一律回滚，**不留下部分数据**。
+
+### `GET /dispatch/sessions/{session_id}/vouchers` — 按出单次序查询凭证与待出单状态
+
+| 字段 | 说明 |
+|---|---|
+| `current_revision` | 会话当前修订号（未更正为 0） |
+| `pending.current_revision` | 同上（待出单状态对象内冗余一份） |
+| `pending.voucher_revisions` | **已出单的修订号**，按出单次序排列（允许不连续，如 `[0, 3]`） |
+| `pending.next_revision_settled` | 当前修订号是否已有凭证：`false` 即当前修订尚待出单 |
+| `vouchers` | 全部已出凭证，按**出单次序**（`voucher_no` 升序），每张均为落盘时冻结的内容：`voucher_id`、`revision_no`、出单当时的 `current_revision`、`total_cost_yuan`、`billing`、`issued_at`、冻结的 `records` 与完整 `settlement` |
+
+凭证与会话同在命名卷 SQLite 中，**进程重启后仍可按出单次序查询**，且同修订号重试仍取回原凭证。未满期会话出单 / 查询均返回 422 `voucher_not_complete`；未知会话 404。
+
+凭证接口的错误码（`voucher_revision_conflict` 为 **HTTP 409**、`session_not_found` 为 **HTTP 404**，其余为 422）：
+
+- `voucher_not_complete`：会话未满期，不允许出单 / 查询凭证；
+- `voucher_partial_settled`：该版台账只能结算有效前缀（错误体附 `first_anomaly_index` 与 `settled_periods`），整次拒绝、不留凭证；
+- `voucher_revision_conflict`（409）：请求修订号未出单且不是当前修订号（漏开的过期版本或超前版本），错误体附 `current_revision`；
+- `no_valid_interval` / `plan_snapshot_mismatch` 等：沿用 `/dispatch/settlement` 的整体拒绝错误码，同样不留下凭证；
+- `session_not_found`（404）：会话 ID 不存在；
+- `invalid_input`：期望修订号为负等请求体非法。
+
+### 可执行示例（出单、修订后补退、跳过与查询）
+
+下例独立创建一个 4 段满期会话（t0 谷时充 0.2kWh、t1/t2 各放 0.1kWh、t3 静置；效率 0.9、容差 0.01kWh），最初上报口径实测总费用 **0.10 元**。需要 `jq`，先 `docker compose up -d --build`。
+
+```bash
+BASE=http://localhost:8000
+
+# 0) 创建会话并追加为满期（计划由服务端重算核对）
+cat > /tmp/v-dispatch.json <<'JSON'
+{
+  "prices": [0.0, 1.0, 1.0, 0.0],
+  "base_load_kw": [0.2, 0.2, 0.2, 0.2],
+  "pv_kw": [0.0, 0.0, 0.0, 0.0],
+  "capacity_kwh": 0.4,
+  "max_charge_kw": 1.0,
+  "max_discharge_kw": 1.0,
+  "charge_efficiency": 0.9,
+  "discharge_efficiency": 0.9,
+  "initial_soc_kwh": 0.0,
+  "min_terminal_soc_kwh": 0.0,
+  "degradation_cost_per_kwh": 0.2
+}
+JSON
+curl -s -X POST $BASE/dispatch -H 'Content-Type: application/json' \
+  -d @/tmp/v-dispatch.json | jq -c . > /tmp/v-plan.json
+VSID=$(curl -s -X POST $BASE/dispatch/sessions -H 'Content-Type: application/json' \
+  -d "$(jq -n --slurpfile d /tmp/v-dispatch.json --slurpfile p /tmp/v-plan.json \
+        '{dispatch:$d[0], plan_snapshot:$p[0], audit_tolerance_kwh:0.01}')" \
+  | jq -r .session_id)
+cat > /tmp/v-batch0.json <<'JSON'
+{"start_index": 0, "records": [
+  {"base_load_kw": 0.2, "pv_kw": 0.0,
+   "charge_ac_energy_kwh": 0.222222, "discharge_ac_energy_kwh": 0.0,
+   "grid_purchase_energy_kwh": 0.322222, "soc_start_kwh": 0.0, "soc_end_kwh": 0.2},
+  {"base_load_kw": 0.2, "pv_kw": 0.0,
+   "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.09,
+   "grid_purchase_energy_kwh": 0.01, "soc_start_kwh": 0.2, "soc_end_kwh": 0.1}
+]}
+JSON
+cat > /tmp/v-batch2.json <<'JSON'
+{"start_index": 2, "records": [
+  {"base_load_kw": 0.2, "pv_kw": 0.0,
+   "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.09,
+   "grid_purchase_energy_kwh": 0.01, "soc_start_kwh": 0.1, "soc_end_kwh": 0.0},
+  {"base_load_kw": 0.2, "pv_kw": 0.0,
+   "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.0,
+   "grid_purchase_energy_kwh": 0.1, "soc_start_kwh": 0.0, "soc_end_kwh": 0.0}
+]}
+JSON
+curl -s -X POST $BASE/dispatch/sessions/$VSID/batches -H 'Content-Type: application/json' \
+  -d @/tmp/v-batch0.json | jq '{result, status}'
+curl -s -X POST $BASE/dispatch/sessions/$VSID/batches -H 'Content-Type: application/json' \
+  -d @/tmp/v-batch2.json | jq '{result, status}'
+
+# 1) 首张凭证：修订号 0（最初上报记录），计费栏记全额 0.10 元
+curl -s -X POST $BASE/dispatch/sessions/$VSID/vouchers \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 0}' \
+  | tee /tmp/v-voucher0.json | jq \
+    '{voucher_no, result, revision_no, total_cost_yuan, billing, issued_at}'
+# => {"voucher_no":1,"result":"issued","revision_no":0,"total_cost_yuan":0.1,
+#     "billing":{"type":"full","amount_yuan":0.1,"relative_to_revision":null,
+#                "relative_to_voucher_no":null},"issued_at":"...Z"}
+
+# 2) 计量表更正：t1 实际负荷 0.22kW、购电量 0.02kWh（SOC/充放电轨迹不变），
+#    该时段多购 0.01kWh × 1 元 = 多 0.01 元
+cat > /tmp/v-rev1.json <<'JSON'
+{"expected_revision": 0, "changes": [
+  {"index": 1, "record":
+    {"base_load_kw": 0.22, "pv_kw": 0.0,
+     "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.09,
+     "grid_purchase_energy_kwh": 0.02, "soc_start_kwh": 0.2, "soc_end_kwh": 0.1}}
+]}
+JSON
+curl -s -X POST $BASE/dispatch/sessions/$VSID/revisions \
+  -H 'Content-Type: application/json' -d @/tmp/v-rev1.json | jq '{current_revision}'
+
+# 3) 对修订 1 出单：相对上一张（修订 0）应补 0.01 元
+curl -s -X POST $BASE/dispatch/sessions/$VSID/vouchers \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 1}' \
+  | tee /tmp/v-voucher1.json | jq \
+    '{voucher_no, revision_no, total_cost_yuan, billing}'
+# => {"voucher_no":2,"revision_no":1,"total_cost_yuan":0.11,
+#     "billing":{"type":"supplement","amount_yuan":0.01,
+#                "relative_to_revision":0,"relative_to_voucher_no":1}}
+
+# 4) 同一修订号重试：返回原凭证（result=existing），即使修订继续前进也不变
+curl -s -X POST $BASE/dispatch/sessions/$VSID/vouchers \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 0}' \
+  | jq --slurpfile orig /tmp/v-voucher0.json \
+    '{result, total_cost_yuan, billing, same_voucher: (.voucher_id == $orig[0].voucher_id)}'
+# => {"result":"existing","total_cost_yuan":0.1,
+#     "billing":{"type":"full", ...},"same_voucher":true}
+
+# 5) 再更正（修订 2）后，漏开的修订 1 已出过单；演示过期未出单冲突：
+#    先推进到修订 3 且修订 2 不出单——把 t1 改到负荷 0.18（期望购电 0，总费用 0.09）
+cat > /tmp/v-rev2.json <<'JSON'
+{"expected_revision": 1, "changes": [
+  {"index": 1, "record":
+    {"base_load_kw": 0.24, "pv_kw": 0.0,
+     "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.09,
+     "grid_purchase_energy_kwh": 0.03, "soc_start_kwh": 0.2, "soc_end_kwh": 0.1}}
+]}
+JSON
+curl -s -X POST $BASE/dispatch/sessions/$VSID/revisions \
+  -H 'Content-Type: application/json' -d @/tmp/v-rev2.json | jq '{current_revision}'  # => 2
+cat > /tmp/v-rev3.json <<'JSON'
+{"expected_revision": 2, "changes": [
+  {"index": 1, "record":
+    {"base_load_kw": 0.18, "pv_kw": 0.0,
+     "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.09,
+     "grid_purchase_energy_kwh": 0.0, "soc_start_kwh": 0.2, "soc_end_kwh": 0.1}}
+]}
+JSON
+curl -s -X POST $BASE/dispatch/sessions/$VSID/revisions \
+  -H 'Content-Type: application/json' -d @/tmp/v-rev3.json | jq '{current_revision}'  # => 3
+
+#    对未出单的过期修订 2 补开 → 409 冲突并给出当前号，不写入
+curl -s -X POST $BASE/dispatch/sessions/$VSID/vouchers \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 2}' | jq '{error, current_revision}'
+# => {"error":"voucher_revision_conflict","current_revision":3}
+
+# 6) 跳过未出单的修订 2，直接对当前修订 3 出单：
+#    差额相对最近一张已出凭证（修订 1 的 0.11）→ 应退 0.02 元
+curl -s -X POST $BASE/dispatch/sessions/$VSID/vouchers \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 3}' \
+  | jq '{voucher_no, revision_no, total_cost_yuan, billing}'
+# => {"voucher_no":3,"revision_no":3,"total_cost_yuan":0.09,
+#     "billing":{"type":"refund","amount_yuan":0.02,
+#                "relative_to_revision":1,"relative_to_voucher_no":2}}
+
+# 7) 按出单次序查询全部凭证 + 当前修订待出单状态
+curl -s $BASE/dispatch/sessions/$VSID/vouchers | jq \
+  '{current_revision, pending,
+    vouchers: [.vouchers[] | {voucher_no, revision_no, total_cost_yuan, billing}]}'
+# => {"current_revision":3,
+#     "pending":{"current_revision":3,"voucher_revisions":[0,1,3],
+#                "next_revision_settled":true},
+#     "vouchers":[{voucher_no:1, revision_no:0, total_cost_yuan:0.1,  billing:{type:"full",…}},
+#                 {voucher_no:2, revision_no:1, total_cost_yuan:0.11, billing:{type:"supplement",…}},
+#                 {voucher_no:3, revision_no:3, total_cost_yuan:0.09, billing:{type:"refund",…}}]}
+
+#    单张凭证里还带有冻结的完整结算报告（口径同 /dispatch/settlement）与该版台账
+curl -s $BASE/dispatch/sessions/$VSID/vouchers > /tmp/v-list.json
+jq '.vouchers[1] | {revision_no,
+  settlement_status: .settlement.status,
+  settled_periods: .settlement.settled_periods,
+  t1_actual_grid: .settlement.periods[1].actual_grid_purchase_energy_kwh,
+  frozen_t1_record: .records[1].record}' /tmp/v-list.json
+```
+
+只能结算有效前缀时整次拒绝且不留凭证（修订台账遥测自洽、但 SOC 轨迹偏离原计划）：
+
+```bash
+# 另建一个满期会话 VSID2，提交「t1 只放 0.05kWh、后续 SOC 链自洽承接」的更正
+# （构造略，见修订接口示例）；该台账遥测审计通过，但 t1 起 SOC 偏离计划轨迹
+curl -s -X POST $BASE/dispatch/sessions/$VSID2/vouchers \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 1}' \
+  | jq '{error, first_anomaly_index, settled_periods}'
+# => {"error":"voucher_partial_settled","first_anomaly_index":1,"settled_periods":1}
+curl -s $BASE/dispatch/sessions/$VSID2/vouchers | jq '.vouchers | length'   # => 0（未留凭证）
+# 再提交一次把台账修复回计划轨迹的修订（修订号 2）后，即可对修订 2 正常出单
+```
+
+重启验证：`docker compose restart`（命名卷保留）后再次执行第 7 步，凭证次序与冻结内容仍在；对修订 0/1/3 重试仍分别返回各自的原凭证（`result=existing`）。
+
 ### 持久化
 
-会话、逐段记录、批次边界、首次回执与计量表修订存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话、已确认记录与历次修订**原样保留**，可继续查询、幂等重试、续报与在当前修订号上继续更正。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界 / 修订表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重；修订表为空时修订查询返回修订号 0（台账即最初上报记录）。
+会话、逐段记录、批次边界、首次回执、计量表修订与逐版结算凭证存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话、已确认记录、历次修订与已出凭证**原样保留**，可继续查询、幂等重试、续报、在当前修订号上继续更正，并可按出单次序取回冻结凭证。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界 / 修订 / 凭证表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重；修订表为空时修订查询返回修订号 0（台账即最初上报记录）；凭证表为空时凭证查询返回空列表与当前修订待出单状态。
 
 ### 可执行示例（创建、分批追加、重试、查询、续排/结算）
 
@@ -904,6 +1103,15 @@ jq -c '{dispatch, plan_snapshot, audit_tolerance_kwh,
 - `session_not_found`（404）：会话 ID 不存在；
 - `invalid_input`：期望修订号为负、`changes` 为空 / 超长、替换记录负值 / 非有限 / SOC 超容量等。
 
+逐版结算凭证接口的错误码（`POST/GET .../vouchers`；除 `voucher_revision_conflict` 为 **HTTP 409**、`session_not_found` 为 **HTTP 404** 外，其余为 422）：
+
+- `voucher_not_complete`：会话未满期，不能出单 / 查询凭证；
+- `voucher_partial_settled`：该版台账只能结算首条异常 / SOC 断点之前的有效前缀（错误体附 `first_anomaly_index`、`settled_periods`），整次拒绝、不留下凭证；
+- `voucher_revision_conflict`（409）：请求修订号**未出单且不是当前修订号**——漏开的过期中间修订（不能补开）或超前修订，错误体顶层附 `current_revision`，本次不写入；已出单的修订号即使过期也不走冲突，而是幂等返回原凭证；
+- `no_valid_interval` / `plan_snapshot_mismatch` 等：沿用 `/dispatch/settlement` 的整体拒绝错误码（如首条即异常或 SOC 断点），同样不留下凭证；
+- `session_not_found`（404）：会话 ID 不存在；
+- `invalid_input`：期望修订号为负等请求体非法。
+
 注意：已执行动作**偏离旧计划**本身不构成拒绝——只要实测记录自洽（含相邻记录 SOC 衔接），偏离只作为 `soc_gap_*` 与各费用差额信息返回，续排一律以实测末态为准。
 
 ## 测试
@@ -913,4 +1121,4 @@ pip install pytest httpx
 pytest tests/ -q
 ```
 
-覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。续排部分覆盖：原时间轴已执行/待执行明细与费用口径、余段电价变化后的最优重排、实测偏离旧计划但自洽时保留原记录并从末态重排、容差内表计偏差照实计费、余段输入与快照的结算接口端到端衔接（含余段仅一段）、首态 SOC 容差边界（等于容差通过、超出拒绝），以及前缀审计异常、首态未接原初值、末态非 0.1kWh 网格、余段末端约束不可达（`infeasible`）、快照篡改、长度不符、空前缀/全周期前缀、非法容差/测量值/余段预测等各类整体拒绝。执行会话部分覆盖：创建时快照重算核对（含篡改、原输入无解）、分批追加的首批/后续批首态衔接（含容差边界）、动作偏离计划但自洽仍接受、下标跳跃与越界整批不入库且无副作用、批内核电芯能量/购电量/SOC 衔接异常整批拒绝、同起点原样重试返回 deduped、同起点内容不同（含部分重叠）返回 409、并发同起点上报只有一份生效（多线程）、查询返回原计划与连续已确认记录及下一下标、未完成前缀端到端续排、满期记录端到端结算、按同一路径重建存储模拟进程重启后记录仍在且可续报、空批/负值/SOC 超容量等非法输入拦截，以及既有四个接口行为不变。计量表更正部分覆盖：修订号 0 查询即原始台账且结算请求可直接用、首次更正在当前版本上整段重核并原子落盘（乱序提交按下标落位、未指定时段保持原值）、后续修订叠加与改回原值后差异下标清空、期望修订号过期返回 409 及当前号、下标重复/越界整次拒绝并点名下标、电芯能量/购电量失衡与相邻 SOC 断点（含只改中段不修衔接链）整次拒绝且已有修订不变、首态对原初始 SOC 的锚点核对与容差边界、替换记录负值/SOC 超容量/空变更等非法输入、未满期拒绝更正与查询、未知会话 404、更正不改写最初上报证据且批次重试仍 deduped 并保持冻结回执、修订台账端到端提交现有结算接口（修订口径计费、原始口径不受影响）、按同一路径重建存储模拟重启后修订仍可查询并在当前号上继续更正（旧号冲突）、并发同期望修订号只有一份生效（多线程），以及会话详情暴露当前修订号且列表口径不变。
+覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。续排部分覆盖：原时间轴已执行/待执行明细与费用口径、余段电价变化后的最优重排、实测偏离旧计划但自洽时保留原记录并从末态重排、容差内表计偏差照实计费、余段输入与快照的结算接口端到端衔接（含余段仅一段）、首态 SOC 容差边界（等于容差通过、超出拒绝），以及前缀审计异常、首态未接原初值、末态非 0.1kWh 网格、余段末端约束不可达（`infeasible`）、快照篡改、长度不符、空前缀/全周期前缀、非法容差/测量值/余段预测等各类整体拒绝。执行会话部分覆盖：创建时快照重算核对（含篡改、原输入无解）、分批追加的首批/后续批首态衔接（含容差边界）、动作偏离计划但自洽仍接受、下标跳跃与越界整批不入库且无副作用、批内核电芯能量/购电量/SOC 衔接异常整批拒绝、同起点原样重试返回 deduped、同起点内容不同（含部分重叠）返回 409、并发同起点上报只有一份生效（多线程）、查询返回原计划与连续已确认记录及下一下标、未完成前缀端到端续排、满期记录端到端结算、按同一路径重建存储模拟进程重启后记录仍在且可续报、空批/负值/SOC 超容量等非法输入拦截，以及既有四个接口行为不变。计量表更正部分覆盖：修订号 0 查询即原始台账且结算请求可直接用、首次更正在当前版本上整段重核并原子落盘（乱序提交按下标落位、未指定时段保持原值）、后续修订叠加与改回原值后差异下标清空、期望修订号过期返回 409 及当前号、下标重复/越界整次拒绝并点名下标、电芯能量/购电量失衡与相邻 SOC 断点（含只改中段不修衔接链）整次拒绝且已有修订不变、首态对原初始 SOC 的锚点核对与容差边界、替换记录负值/SOC 超容量/空变更等非法输入、未满期拒绝更正与查询、未知会话 404、更正不改写最初上报证据且批次重试仍 deduped 并保持冻结回执、修订台账端到端提交现有结算接口（修订口径计费、原始口径不受影响）、按同一路径重建存储模拟重启后修订仍可查询并在当前号上继续更正（旧号冲突）、并发同期望修订号只有一份生效（多线程），以及会话详情暴露当前修订号且列表口径不变。逐版结算凭证部分覆盖：修订号 0 首张凭证对最初上报记录全额结算且冻结的结算报告与现有结算接口逐字段一致、修订后应补/应退/无差额三档计费（含 t1 购电调整的费用传导与谷时改读数不影响费用）、差额相对最近一张已出凭证从而可跳过未出单的中间修订、同一修订号重试原样返回冻结凭证（result=existing，voucher_id/出单时间/计费栏/台账不变）且即使后续修订继续推进也不受影响、未出单的过期中间修订与超前修订均返回 409 voucher_revision_conflict 及当前号且不写入、台账只能结算有效前缀（voucher_partial_settled，附首异常下标与已结算段数）与首条即断点（no_valid_interval）均整次拒绝且凭证表为空、修复台账后可对新修订号正常出单、未满期出单/查询 422、未知会话 404、负修订号 422、按出单次序列表与当前修订待出单状态（voucher_revisions/next_revision_settled）、重启后凭证次序与冻结内容仍在且重试仍幂等并可继续出单（序号接续）、旧库自动补建凭证表、同修订多线程并发出单恰好一份落盘其余 existing、出单与更正多轮并发交错下凭证永远冻结最初台账或出单 409 而无部分数据，以及原会话、批次重试、修订查询与现有结算接口行为不变。

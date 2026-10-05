@@ -23,14 +23,18 @@ from app.models import (
     SessionListResponse,
     SettlementRequest,
     SettlementResponse,
+    SettlementVoucherResponse,
     TelemetryAuditRequest,
     TelemetryAuditResponse,
+    VoucherIssueRequest,
+    VoucherListResponse,
 )
 from app.replan import ReplanError, execute_replan
 from app.revisions import RevisionError, get_revision, submit_revision
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
 from app.settlement import SettlementError, execute_settlement
 from app.solver import InfeasibleError, solve_dispatch
+from app.vouchers import VoucherError, issue_voucher, list_vouchers
 
 app = FastAPI(
     title="家庭储能时段调度 API",
@@ -51,9 +55,15 @@ app = FastAPI(
         "满期会话可经 /dispatch/sessions/{id}/revisions 提交计量表更正："
         "按期望修订号叠加「下标 + 完整替换记录」，整段台账重核通过后原子落盘，"
         "最初上报证据与批次首收回执永不改写，查询返回原始/修订台账、差异下标"
-        "与可直接提交结算接口的完整请求数据。"
+        "与可直接提交结算接口的完整请求数据；"
+        "满期会话还可经 /dispatch/sessions/{id}/vouchers 按修订号出具可追溯的"
+        "逐版结算凭证：修订号 0 对最初上报记录、其余版本对对应更正台账，"
+        "沿用现有结算规则核算（只能结算有效前缀时整次拒绝且不留凭证），"
+        "首张凭证记全额、其后每张列相对上一张的应补/应退差额（可跳过未出单"
+        "中间修订），同一修订号重试原样返回冻结凭证、未出单的过期修订号返回 "
+        "409 及当前号；凭证与出单次序持久化在 SQLite 中，重启后仍可查。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -108,6 +118,18 @@ async def session_error_handler(request: Request, exc: SessionError):
 async def revision_error_handler(request: Request, exc: RevisionError):
     body = {"error": exc.code, "reason": str(exc)}
     # 附加字段（如修订号冲突时的 current_revision）随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+    )
+
+
+@app.exception_handler(VoucherError)
+async def voucher_error_handler(request: Request, exc: VoucherError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如冲突时的 current_revision、前缀结算时的 first_anomaly_index）
+    # 随错误体顶层返回
     body.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
@@ -325,6 +347,57 @@ async def get_session_revision(session_id: str) -> RevisionDetailResponse:
     无更正时当前修订号为 0、修订台账即最初上报记录。"""
     result = get_revision(session_id)
     return RevisionDetailResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/sessions/{session_id}/vouchers",
+    response_model=SettlementVoucherResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "会话不存在"},
+        409: {"model": ErrorResponse, "description": "请求修订号未出单且不是当前修订号（附当前号）"},
+        422: {"model": ErrorResponse, "description": "未满期或该版只能结算有效前缀（整次拒绝不留凭证）"},
+    },
+    tags=["sessions"],
+)
+async def issue_session_voucher(
+    session_id: str, req: VoucherIssueRequest
+) -> SettlementVoucherResponse:
+    """为满期会话按修订号出具逐版结算凭证。
+
+    - 修订号 0 对最初上报记录结算，n≥1 对修订号 n 的更正台账结算；
+      核算完全沿用现有结算规则（原计划重算核对、遥测审计、SOC 轨迹核对、计费），
+      只能结算有效前缀时整体拒绝（voucher_partial_settled）且不留下凭证；
+    - 首张凭证计费栏记全额，其后每张列相对上一张凭证的应补/应退差额，
+      允许跳过未出单的中间修订；
+    - 同一修订号重试返回落盘时冻结的原凭证（result=existing），即使后来已有更新修订；
+    - 请求修订号未出单且不等于当前修订号（漏开的过期版本或超前版本）
+      → 409 voucher_revision_conflict，错误体附 current_revision；
+    - 出单与计量表更正在同一 SQLite 写事务锁下串行，凭证不会引用过期台账，
+      失败回滚不留下部分数据。
+    """
+    result = issue_voucher(
+        session_id=session_id,
+        expected_revision=req.expected_revision,
+    )
+    return SettlementVoucherResponse.model_validate(result)
+
+
+@app.get(
+    "/dispatch/sessions/{session_id}/vouchers",
+    response_model=VoucherListResponse,
+    responses={404: {"model": ErrorResponse, "description": "会话不存在"}},
+    tags=["sessions"],
+)
+async def list_session_vouchers(session_id: str) -> VoucherListResponse:
+    """按出单次序（voucher_no 升序）查询全部已出凭证，并给出当前修订待出单状态：
+
+    - vouchers[*] 均为落盘时冻结的内容（台账、结算报告、计费栏、出单时间）；
+    - pending.current_revision 为当前修订号，pending.next_revision_settled
+      表示当前修订是否已有凭证（false 即当前修订尚待出单），
+      pending.voucher_revisions 为已出单修订号（按出单次序，未必连续）。
+    """
+    result = list_vouchers(session_id)
+    return VoucherListResponse.model_validate(result)
 
 
 @app.get(

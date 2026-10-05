@@ -16,10 +16,15 @@
   每次提交存原始变更（下标 + 完整替换记录）与叠加后的整段修订台账，
   修订号与会话进度无关、从 1 起单调递增；最初上报的 session_records 与
   session_batches 永不被更正改写；
-- 旧库只有 sessions / session_records 两张表时，session_batches 与
-  session_revisions 由 CREATE TABLE IF NOT EXISTS 自动补齐（空表）：
-  查询与从 next_index 续报不受影响；已确认区间内没有批次边界可核对，
-  不按前缀猜测去重。
+- session_settlement_vouchers 按 (session_id, voucher_no) 记录出单次序，
+  (session_id, revision_no) 主键保证同一修订号只出一张凭证（重试幂等）：
+  每张凭证冻结出单时该修订的整段台账（ledger_json）与完整结算结果
+  （settlement_json）、首张/应补/应退计费信息与出单时间；凭证一经落盘
+  即不可变，后续更正只新增修订行，从不改写已有凭证；
+- 旧库只有 sessions / session_records 两张表时，session_batches、
+  session_revisions 与 session_settlement_vouchers 由 CREATE TABLE IF NOT
+  EXISTS 自动补齐（空表）：查询与从 next_index 续报不受影响；已确认区间内
+  没有批次边界可核对，不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -32,8 +37,9 @@ from typing import Iterator, List, Optional
 
 # 单条记录为半小时实测，计划最长 200 段，记录列只存 JSON，无需额外规模设计。
 # session_batches 为批次边界与首收回执表；session_revisions 为计量表更正表
-# （存每次提交的原始变更与叠加后的整段修订台账），均为后加的新表，旧库打开时
-# 由 IF NOT EXISTS 自动补建。
+# （存每次提交的原始变更与叠加后的整段修订台账）；session_settlement_vouchers
+# 为逐版结算凭证表（冻结该版台账、完整结算结果与首单/补退计费），均为后加的
+# 新表，旧库打开时由 IF NOT EXISTS 自动补建。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -69,6 +75,26 @@ CREATE TABLE IF NOT EXISTS session_revisions (
     PRIMARY KEY (session_id, revision_no),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
+CREATE TABLE IF NOT EXISTS session_settlement_vouchers (
+    voucher_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    voucher_no INTEGER NOT NULL,
+    revision_no INTEGER NOT NULL,
+    current_revision_at_issue INTEGER NOT NULL,
+    ledger_json TEXT NOT NULL,
+    settlement_json TEXT NOT NULL,
+    total_cost_yuan REAL NOT NULL,
+    billing_type TEXT NOT NULL,
+    amount_yuan REAL NOT NULL,
+    relative_to_revision INTEGER,
+    relative_to_voucher_no INTEGER,
+    issued_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, revision_no),
+    UNIQUE (session_id, voucher_no),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vouchers_order
+    ON session_settlement_vouchers(session_id, voucher_no);
 """
 
 
@@ -285,6 +311,111 @@ class SessionStore:
             "(session_id, revision_no, changes_json, ledger_json, created_at)"
             " VALUES (?, ?, ?, ?, ?)",
             (session_id, revision_no, changes_json, ledger_json, created_at),
+        )
+
+    def get_all_records_in_txn(
+        self, conn: sqlite3.Connection, session_id: str
+    ) -> List[sqlite3.Row]:
+        """写事务内取全部最初上报记录（按下标升序）；修订号 0 的台账即它。"""
+        return list(
+            conn.execute(
+                "SELECT idx, record_json, stored_at FROM session_records "
+                "WHERE session_id = ? ORDER BY idx",
+                (session_id,),
+            ).fetchall()
+        )
+
+    def get_revision_row(
+        self, conn: sqlite3.Connection, session_id: str, revision_no: int
+    ) -> Optional[sqlite3.Row]:
+        """写事务内取指定修订号的更正行；不存在（含修订号 0）返回 None。"""
+        return conn.execute(
+            "SELECT revision_no, changes_json, ledger_json, created_at"
+            " FROM session_revisions WHERE session_id = ? AND revision_no = ?",
+            (session_id, revision_no),
+        ).fetchone()
+
+    def count_vouchers(self, conn: sqlite3.Connection, session_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM session_settlement_vouchers WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return int(row["c"])
+
+    def get_voucher(
+        self, conn: sqlite3.Connection, session_id: str, revision_no: int
+    ) -> Optional[sqlite3.Row]:
+        """按修订号取已出凭证；该修订未出单返回 None（重试幂等判定以此为准）。"""
+        return conn.execute(
+            "SELECT * FROM session_settlement_vouchers"
+            " WHERE session_id = ? AND revision_no = ?",
+            (session_id, revision_no),
+        ).fetchone()
+
+    def get_latest_voucher(
+        self, conn: sqlite3.Connection, session_id: str
+    ) -> Optional[sqlite3.Row]:
+        """按出单次序取最后一张凭证（voucher_no 最大）；从未出单返回 None。"""
+        return conn.execute(
+            "SELECT * FROM session_settlement_vouchers"
+            " WHERE session_id = ? ORDER BY voucher_no DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+
+    def list_voucher_rows(self, session_id: str) -> List[sqlite3.Row]:
+        """按出单次序（voucher_no 升序）列出会话的全部凭证。"""
+        with self._lock, self._connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM session_settlement_vouchers"
+                    " WHERE session_id = ? ORDER BY voucher_no",
+                    (session_id,),
+                ).fetchall()
+            )
+
+    def insert_voucher(
+        self,
+        conn: sqlite3.Connection,
+        voucher_id: str,
+        session_id: str,
+        voucher_no: int,
+        revision_no: int,
+        current_revision_at_issue: int,
+        ledger_json: str,
+        settlement_json: str,
+        total_cost_yuan: float,
+        billing_type: str,
+        amount_yuan: float,
+        relative_to_revision: Optional[int],
+        relative_to_voucher_no: Optional[int],
+        issued_at: str,
+    ) -> None:
+        """与「核对修订号、取该版台账、核算」同一事务原子落盘凭证。
+
+        (session_id, revision_no) 主键使同修订并发出单只有一份成功；
+        (session_id, voucher_no) 唯一键使出单次序号不重复。
+        """
+        conn.execute(
+            "INSERT INTO session_settlement_vouchers"
+            "(voucher_id, session_id, voucher_no, revision_no, current_revision_at_issue,"
+            " ledger_json, settlement_json, total_cost_yuan, billing_type, amount_yuan,"
+            " relative_to_revision, relative_to_voucher_no, issued_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                voucher_id,
+                session_id,
+                voucher_no,
+                revision_no,
+                current_revision_at_issue,
+                ledger_json,
+                settlement_json,
+                total_cost_yuan,
+                billing_type,
+                amount_yuan,
+                relative_to_revision,
+                relative_to_voucher_no,
+                issued_at,
+            ),
         )
 
 
