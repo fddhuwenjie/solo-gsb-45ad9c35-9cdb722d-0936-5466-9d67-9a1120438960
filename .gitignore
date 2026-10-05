@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.pylibs/
+*.egg-info/
+.DS_Store
+
+# 裸机运行时执行会话 SQLite 的默认回退目录（容器内用命名卷 /data）
+data/

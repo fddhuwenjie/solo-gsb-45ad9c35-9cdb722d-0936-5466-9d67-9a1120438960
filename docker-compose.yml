@@ -1,0 +1,23 @@
+services:
+  storage-dispatch:
+    build: .
+    image: home-storage-dispatch:latest
+    container_name: home-storage-dispatch
+    ports:
+      - "8000:8000"
+    environment:
+      # 执行会话 SQLite 路径（默认即 /data/sessions.db，此处显式标注便于覆盖）
+      DISPATCH_SESSION_DB: /data/sessions.db
+    volumes:
+      # 命名卷持久化执行会话：容器重建/进程重启后已确认记录仍在
+      - dispatch-session-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  dispatch-session-data:
