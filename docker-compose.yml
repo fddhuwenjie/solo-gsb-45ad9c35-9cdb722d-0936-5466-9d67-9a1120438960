@@ -6,10 +6,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # 执行会话 SQLite 路径（默认即 /data/sessions.db，此处显式标注便于覆盖）
+      # 会话 / 计量表修订 / 逐版结算凭证的 SQLite 路径（默认即 /data/sessions.db，此处显式标注便于覆盖）
       DISPATCH_SESSION_DB: /data/sessions.db
     volumes:
-      # 命名卷持久化执行会话：容器重建/进程重启后已确认记录仍在
+      # 命名卷持久化执行会话、修订台账与结算凭证：容器重建/进程重启后均仍在
       - dispatch-session-data:/data
     restart: unless-stopped
     healthcheck:

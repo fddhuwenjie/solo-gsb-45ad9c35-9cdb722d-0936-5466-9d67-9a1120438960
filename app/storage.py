@@ -16,10 +16,15 @@
   每次提交存原始变更（下标 + 完整替换记录）与叠加后的整段修订台账，
   修订号与会话进度无关、从 1 起单调递增；最初上报的 session_records 与
   session_batches 永不被更正改写；
-- 旧库只有 sessions / session_records 两张表时，session_batches 与
-  session_revisions 由 CREATE TABLE IF NOT EXISTS 自动补齐（空表）：
-  查询与从 next_index 续报不受影响；已确认区间内没有批次边界可核对，
-  不按前缀猜测去重。
+- session_vouchers 按 (session_id, revision_no) 主键保存逐版结算凭证：
+  每个修订号至多一张（重试幂等返回原凭证），sequence_no 记录会话内出单
+  次序（允许跳过未出单的中间修订），voucher_json 冻结出单时的完整结算
+  报告与补/退差额；凭证只在写事务内「核对当前修订号 → 取该版台账 →
+  全额结算通过」后与序号一同原子插入，失败回滚不留部分数据；
+- 旧库只有 sessions / session_records 两张表时，session_batches、
+  session_revisions 与 session_vouchers 由 CREATE TABLE IF NOT EXISTS
+  自动补齐（空表）：查询与从 next_index 续报不受影响；已确认区间内没有
+  批次边界可核对，不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -69,6 +74,17 @@ CREATE TABLE IF NOT EXISTS session_revisions (
     PRIMARY KEY (session_id, revision_no),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
+CREATE TABLE IF NOT EXISTS session_vouchers (
+    session_id TEXT NOT NULL,
+    revision_no INTEGER NOT NULL,
+    sequence_no INTEGER NOT NULL,
+    voucher_json TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, revision_no),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_vouchers_seq
+    ON session_vouchers(session_id, sequence_no);
 """
 
 
@@ -252,6 +268,16 @@ class SessionStore:
             (session_id,),
         ).fetchone()
 
+    def get_revision_row(
+        self, conn: sqlite3.Connection, session_id: str, revision_no: int
+    ) -> Optional[sqlite3.Row]:
+        """取指定修订号的更正行（用于按版取台账）；该修订号不存在返回 None。"""
+        return conn.execute(
+            "SELECT revision_no, changes_json, ledger_json, created_at"
+            " FROM session_revisions WHERE session_id = ? AND revision_no = ?",
+            (session_id, revision_no),
+        ).fetchone()
+
     def list_revision_rows(self, session_id: str) -> List[sqlite3.Row]:
         """按修订号升序列出会话的全部更正行（首条即修订号 1）。"""
         with self._lock, self._connect() as conn:
@@ -285,6 +311,67 @@ class SessionStore:
             "(session_id, revision_no, changes_json, ledger_json, created_at)"
             " VALUES (?, ?, ?, ?, ?)",
             (session_id, revision_no, changes_json, ledger_json, created_at),
+        )
+
+    def get_voucher(
+        self, conn: sqlite3.Connection, session_id: str, revision_no: int
+    ) -> Optional[sqlite3.Row]:
+        """取某修订号已出的凭证行；未出过返回 None（重试时原样取回）。"""
+        return conn.execute(
+            "SELECT revision_no, sequence_no, voucher_json, issued_at"
+            " FROM session_vouchers WHERE session_id = ? AND revision_no = ?",
+            (session_id, revision_no),
+        ).fetchone()
+
+    def get_latest_voucher(
+        self, conn: sqlite3.Connection, session_id: str
+    ) -> Optional[sqlite3.Row]:
+        """取出单次序最大（最近一张）的凭证行；会话从未出单返回 None。"""
+        return conn.execute(
+            "SELECT revision_no, sequence_no, voucher_json, issued_at"
+            " FROM session_vouchers WHERE session_id = ?"
+            " ORDER BY sequence_no DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+
+    def list_voucher_rows(self, session_id: str) -> List[sqlite3.Row]:
+        """按出单次序（sequence_no 升序）列出会话的全部凭证。"""
+        with self._lock, self._connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT revision_no, sequence_no, voucher_json, issued_at"
+                    " FROM session_vouchers WHERE session_id = ?"
+                    " ORDER BY sequence_no",
+                    (session_id,),
+                ).fetchall()
+            )
+
+    def count_vouchers(self, conn: sqlite3.Connection, session_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM session_vouchers WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return int(row["c"])
+
+    def insert_voucher(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        revision_no: int,
+        sequence_no: int,
+        voucher_json: str,
+        issued_at: str,
+    ) -> None:
+        """与「核对修订号、取台账、全额结算」同一事务原子写入凭证与出单次序。
+
+        (session_id, revision_no) 主键保证同一修订号重试只能读到原凭证；
+        (session_id, sequence_no) 唯一索引保证并发出单序号不撞，落败事务回滚。
+        """
+        conn.execute(
+            "INSERT INTO session_vouchers"
+            "(session_id, revision_no, sequence_no, voucher_json, issued_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (session_id, revision_no, sequence_no, voucher_json, issued_at),
         )
 
 

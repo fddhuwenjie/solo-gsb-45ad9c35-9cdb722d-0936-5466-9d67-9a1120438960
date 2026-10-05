@@ -726,3 +726,116 @@ class RevisionDetailResponse(BaseModel):
     settlement_request: SettlementRequestBody = Field(
         description="可直接整体 POST 给 /dispatch/settlement 的完整请求数据"
     )
+
+
+# ---------------------------------------------------------------------------
+# 满期会话逐版结算凭证：可追溯、幂等、并发安全
+# ---------------------------------------------------------------------------
+
+
+class VoucherIssueRequest(BaseModel):
+    """按期望修订号出单：修订号 0 用最初上报记录，其余用对应修订号的更正台账。"""
+
+    expected_revision: int = Field(
+        ge=0,
+        description="要出单的修订号：0 为最初上报记录，其余为对应更正台账；"
+        "只针对当前修订出新凭证，过期 / 超前均返回 409 及当前号；"
+        "同一修订号重试返回已出原凭证（即使后来发生更正）",
+    )
+
+
+class VoucherBilling(BaseModel):
+    """凭证相对上一张凭证的补 / 退信息（首张为全额）。"""
+
+    type: Literal["full", "supplement", "refund", "no_change"] = Field(
+        description="full=首张记全额；supplement=应补；refund=应退；no_change=费用持平"
+    )
+    amount_yuan: float = Field(
+        description="首张为全额实测总费用；之后为应补 / 应退金额的绝对值（持平时为 0）"
+    )
+    delta_yuan: Optional[float] = Field(
+        description="实测总费用 − 上一张凭证实测总费用（首张为 null；正=应补，负=应退）"
+    )
+    previous_voucher_id: Optional[str] = Field(description="上一张凭证 ID（首张为 null）")
+    previous_revision_no: Optional[int] = Field(
+        description="上一张凭证的修订号（首张为 null；允许跳过未出单的中间修订）"
+    )
+    previous_sequence_no: Optional[int] = Field(
+        description="上一张凭证的出单次序（首张为 null）"
+    )
+    description: str = Field(description="补 / 退口径的中文说明")
+
+
+class VoucherSettlementSummary(SettlementSummary):
+    """凭证上的结算摘要：现有结算 summary 之外另带状态与异常 / 断点下标。"""
+
+    status: Literal["settled", "partially_settled"] = Field(
+        description="出单只接受 settled（全额结算）；partially_settled 会被整次拒绝"
+    )
+    settled_periods: int = Field(description="已结算时段数（凭证恒等于全部时段）")
+    pending_periods: int = Field(description="待结算时段数（凭证恒为 0）")
+    first_anomaly_index: Optional[int] = Field(
+        description="首条异常或 SOC 断点下标；全额结算为 null"
+    )
+    anomalous_records: List[int] = Field(description="遥测审计不通过的记录下标")
+    soc_breakpoint_records: List[int] = Field(description="SOC 偏离计划轨迹的记录下标")
+
+
+class SettlementVoucher(BaseModel):
+    """一张逐版结算凭证（首次出单 / 重试均返回同一冻结内容）。"""
+
+    voucher_id: str = Field(description="凭证 ID（UUID），重试同一修订号时保持不变")
+    session_id: str
+    revision_no: int = Field(description="本凭证对应的修订号（0=最初上报记录）")
+    sequence_no: int = Field(description="会话内出单次序，从 1 起单调递增")
+    issued_at: str = Field(description="出单时间（UTC ISO 8601），重试保持首次出单时间")
+    settlement_summary: VoucherSettlementSummary = Field(
+        description="该版完整记录按现有结算规则核算的结算摘要"
+    )
+    actual_total_cost_yuan: float = Field(
+        description="实测总费用（实测购电量能量费 + 实测吞吐量衰减费）"
+    )
+    billing: VoucherBilling = Field(
+        description="首张记全额；之后列相对上一张凭证的应补 / 应退差额"
+    )
+    settlement: SettlementResponse = Field(
+        description="出单时冻结的完整结算报告（逐时段明细、审计残差、SOC 偏差等），"
+        "用于逐版追溯，重试不重新核算"
+    )
+
+
+class VoucherIssueResponse(SettlementVoucher):
+    """出单响应在凭证字段外附带 result：首次出单 / 幂等重试。"""
+
+    result: Literal["issued", "deduped"] = Field(
+        description="issued=新凭证已原子落盘；deduped=该修订号已出过凭证，"
+        "返回首次出单时冻结的原凭证（即使后来发生了更正）"
+    )
+
+
+class CurrentRevisionVoucher(BaseModel):
+    """当前修订已出凭证的定位信息（列表中可取完整凭证）。"""
+
+    revision_no: int
+    sequence_no: int
+    voucher_id: str
+    issued_at: str
+
+
+class VoucherListResponse(BaseModel):
+    """按出单次序查询凭证，并给出当前修订的待出单状态。"""
+
+    session_id: str
+    status: Literal["complete"] = Field(description="仅满期（complete）会话可出具凭证")
+    num_periods: int
+    current_revision: int = Field(description="会话当前修订号（未更正为 0）")
+    voucher_count: int = Field(description="已出具凭证数量")
+    current_revision_voucher: Optional[CurrentRevisionVoucher] = Field(
+        description="当前修订号已出凭证的定位信息；当前修订尚未出单为 null"
+    )
+    current_revision_pending_issuance: bool = Field(
+        description="当前修订是否还有待出单凭证（当前修订号无凭证即为 true）"
+    )
+    vouchers: List[SettlementVoucher] = Field(
+        description="全部凭证，按出单次序（sequence_no 升序）；进程重启后仍可查"
+    )

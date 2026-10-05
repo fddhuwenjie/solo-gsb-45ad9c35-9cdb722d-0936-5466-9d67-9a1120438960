@@ -25,12 +25,16 @@ from app.models import (
     SettlementResponse,
     TelemetryAuditRequest,
     TelemetryAuditResponse,
+    VoucherIssueRequest,
+    VoucherIssueResponse,
+    VoucherListResponse,
 )
 from app.replan import ReplanError, execute_replan
 from app.revisions import RevisionError, get_revision, submit_revision
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
 from app.settlement import SettlementError, execute_settlement
 from app.solver import InfeasibleError, solve_dispatch
+from app.vouchers import VoucherError, issue_voucher, list_vouchers
 
 app = FastAPI(
     title="家庭储能时段调度 API",
@@ -51,9 +55,13 @@ app = FastAPI(
         "满期会话可经 /dispatch/sessions/{id}/revisions 提交计量表更正："
         "按期望修订号叠加「下标 + 完整替换记录」，整段台账重核通过后原子落盘，"
         "最初上报证据与批次首收回执永不改写，查询返回原始/修订台账、差异下标"
-        "与可直接提交结算接口的完整请求数据。"
+        "与可直接提交结算接口的完整请求数据；"
+        "满期会话还可经 /dispatch/sessions/{id}/vouchers 出具可追溯的逐版"
+        "结算凭证：按期望修订号取该版台账（0=最初上报），沿用现有结算规则"
+        "对完整记录全额核算，只能结算有效前缀则整次拒绝不留凭证，首张记全额、"
+        "以后每张列相对上一张的应补/应退差额，同修订号重试返回原凭证。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -108,6 +116,17 @@ async def session_error_handler(request: Request, exc: SessionError):
 async def revision_error_handler(request: Request, exc: RevisionError):
     body = {"error": exc.code, "reason": str(exc)}
     # 附加字段（如修订号冲突时的 current_revision）随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+    )
+
+
+@app.exception_handler(VoucherError)
+async def voucher_error_handler(request: Request, exc: VoucherError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如 voucher_revision_conflict 时的 current_revision）随错误体顶层返回
     body.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
@@ -325,6 +344,55 @@ async def get_session_revision(session_id: str) -> RevisionDetailResponse:
     无更正时当前修订号为 0、修订台账即最初上报记录。"""
     result = get_revision(session_id)
     return RevisionDetailResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/sessions/{session_id}/vouchers",
+    response_model=VoucherIssueResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "会话不存在"},
+        409: {"model": ErrorResponse, "description": "期望修订号非当前号（附当前修订号）"},
+        422: {"model": ErrorResponse, "description": "未满期或该版只能结算有效前缀 / 无可结算区间"},
+    },
+    tags=["sessions"],
+)
+async def issue_session_voucher(
+    session_id: str, req: VoucherIssueRequest
+) -> VoucherIssueResponse:
+    """为满期会话按修订号出具结算凭证（修订号 0=最初上报记录，其余为对应更正台账）。
+
+    - 出单只针对当前修订：期望号过期（且该修订号未出过凭证）或超前均返回 409
+      `voucher_revision_conflict` 及 current_revision，允许跳过未出单的中间修订；
+    - 同一修订号重试幂等返回首次出单时冻结的原凭证（result=deduped），
+      即使后来又发生了更正；
+    - 针对该版完整记录沿用现有结算规则全额核算：只能结算有效前缀
+      （voucher_partial_settlement）或首条即不可结算（voucher_no_valid_interval）
+      时整次拒绝，不留下凭证；
+    - 首张凭证记全额，之后每张列出相对上一张凭证的应补 / 应退差额；
+      「核对修订号 — 取台账 — 结算 — 落盘」在同一事务内完成，
+      并发更正不会让凭证引用过期台账，失败不留部分数据。
+    """
+    result = issue_voucher(
+        session_id=session_id,
+        expected_revision=req.expected_revision,
+    )
+    return VoucherIssueResponse.model_validate(result)
+
+
+@app.get(
+    "/dispatch/sessions/{session_id}/vouchers",
+    response_model=VoucherListResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "会话不存在"},
+        422: {"model": ErrorResponse, "description": "会话未满期"},
+    },
+    tags=["sessions"],
+)
+async def list_session_vouchers(session_id: str) -> VoucherListResponse:
+    """按出单次序查询会话的全部结算凭证（进程重启后仍可查），
+    并给出当前修订号是否还有待出单凭证（current_revision_pending_issuance）。"""
+    result = list_vouchers(session_id)
+    return VoucherListResponse.model_validate(result)
 
 
 @app.get(
